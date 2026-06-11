@@ -48,26 +48,26 @@ mutable struct Block
     # number of available bytes in the decompressed block
     size::Int
 
-    # zstream object
-    zstream::CodecZlib.ZStream
+    # number of valid bytes in compressed_block (read mode only)
+    compressed_size::Int
+
+    # LibDeflate compressor (write) or decompressor (read)
+    libdeflate::Union{LibDeflate.Compressor, LibDeflate.Decompressor}
 end
 
 function Block(mode)
     compressed_block = Vector{UInt8}(undef, BGZF_MAX_BLOCK_SIZE)
     decompressed_block = Vector{UInt8}(undef, BGZF_MAX_BLOCK_SIZE)
 
-    zstream = CodecZlib.ZStream()
     if mode == READ_MODE
-        windowbits = 32 + 15
-        CodecZlib.inflate_init!(zstream, windowbits)
+        libdeflate = LibDeflate.Decompressor()
         size = 0
     else
-        windowbits = 16 + 15
-        CodecZlib.deflate_init!(zstream, CodecZlib.Z_DEFAULT_COMPRESSION, windowbits)
+        libdeflate = LibDeflate.Compressor()
         size = BGZF_SAFE_BLOCK_SIZE
     end
 
-    return Block(compressed_block, decompressed_block, 0, 1, size, zstream)
+    return Block(compressed_block, decompressed_block, 0, 1, size, 0, libdeflate)
 end
 
 # Stream type for the BGZF compression format.
@@ -192,9 +192,6 @@ function Base.close(stream::BGZFStream)
             write_blocks!(stream)
         end
         write(stream.io, EOF_BLOCK)
-    end
-    for block in stream.blocks
-        end_zstream(block.zstream, stream.mode)
     end
     stream.isopen = false
     stream.onclose(stream.io)
@@ -360,7 +357,7 @@ function bgzferror(message::AbstractString="malformed BGZF data")
     throw(BGZFDataError(message))
 end
 
-# Read and inflate blocks.
+# Read and decompress blocks.
 function read_blocks!(stream)
     @assert stream.mode == READ_MODE
 
@@ -379,31 +376,39 @@ function read_blocks!(stream)
             block.block_offset = position(stream.io)
         end
         block.position = 1
-        bsize = read_bgzf_block!(stream.io, block.compressed_block)
-        zstream = block.zstream
-        zstream.next_in = pointer(block.compressed_block)
-        zstream.avail_in = bsize
-        zstream.next_out = pointer(block.decompressed_block)
-        zstream.avail_out = BGZF_MAX_BLOCK_SIZE
+        block.compressed_size = read_bgzf_block!(stream.io, block.compressed_block)
     end
 
-    # inflate blocks in parallel
-    rets = Vector{Cint}(undef, n_blocks)
+    # decompress blocks in parallel
+    had_error = fill(false, n_blocks)
+    error_msgs = fill("", n_blocks)
     Threads.@threads for i in 1:n_blocks
         block = stream.blocks[i]
-        zstream = block.zstream
-        old_avail_out = zstream.avail_out
-        rets[i] = CodecZlib.inflate!(zstream, CodecZlib.Z_FINISH)
-        block.size = old_avail_out - zstream.avail_out
+        decompressor = block.libdeflate::LibDeflate.Decompressor
+        in_data = block.compressed_block
+        GC.@preserve in_data begin
+            result = LibDeflate.unsafe_gzip_decompress!(
+                decompressor,
+                block.decompressed_block,
+                UInt(BGZF_MAX_BLOCK_SIZE),
+                pointer(in_data),
+                block.compressed_size,
+                nothing,
+            )
+        end
+        if result isa LibDeflate.LibDeflateError
+            had_error[i] = true
+            error_msgs[i] = string(result)
+        else
+            block.size = result.len
+        end
     end
 
     for i in 1:n_blocks
-        if rets[i] != CodecZlib.Z_STREAM_END
-            error("zlib failed to inflate a compressed block")
+        if had_error[i]
+            error("LibDeflate failed to decompress BGZF block $i: $(error_msgs[i])")
         end
-        block = stream.blocks[i]
-        @assert block.size ≤ BGZF_MAX_BLOCK_SIZE
-        reset_zstream(block.zstream, stream.mode)
+        @assert stream.blocks[i].size ≤ BGZF_MAX_BLOCK_SIZE
     end
 
     stream.block_index = 1
@@ -476,24 +481,37 @@ function write_blocks!(stream)
 
     for i in 1:n_blocks
         block = stream.blocks[i]
-        zstream = block.zstream
-        zstream.next_in = pointer(block.decompressed_block)
-        zstream.avail_in = block.position - 1
-        zstream.next_out = pointer(block.compressed_block, 9)
-        zstream.avail_out = BGZF_MAX_BLOCK_SIZE - 8
+        compressor = block.libdeflate::LibDeflate.Compressor
+        n_uncompressed = block.position - 1
+        compressed_block = block.compressed_block
+        decompressed_block = block.decompressed_block
 
-        ret = CodecZlib.deflate!(zstream, CodecZlib.Z_FINISH)
-        if ret != CodecZlib.Z_STREAM_END
-            if ret == CodecZlib.Z_OK
-                error("block size may exceed BGZF_MAX_BLOCK_SIZE")
-            else
-                error("failed to compress a BGZF block (zlib error $(ret))")
-            end
+        # Compress raw DEFLATE into compressed_block[19..] (after 18-byte BGZF header)
+        n_compressed = GC.@preserve compressed_block decompressed_block begin
+            LibDeflate.unsafe_compress!(
+                compressor,
+                pointer(compressed_block, 19),
+                UInt(BGZF_MAX_BLOCK_SIZE - 18 - 8),
+                pointer(decompressed_block),
+                n_uncompressed,
+            )
+        end
+        if n_compressed isa LibDeflate.LibDeflateError
+            error("LibDeflate failed to compress BGZF block: $(n_compressed)")
         end
 
-        blocksize = (BGZF_MAX_BLOCK_SIZE - 8) - zstream.avail_out + 8
-        fix_header!(block.compressed_block, blocksize)
-        nb = unsafe_write(stream.io, pointer(block.compressed_block), blocksize)
+        # Append CRC32 and ISIZE after compressed data
+        crc = GC.@preserve decompressed_block LibDeflate.unsafe_crc32(
+            pointer(decompressed_block), n_uncompressed
+        )
+        GC.@preserve compressed_block begin
+            unsafe_store!(Ptr{UInt32}(pointer(compressed_block, 19 + n_compressed)),     htol(crc))
+            unsafe_store!(Ptr{UInt32}(pointer(compressed_block, 19 + n_compressed + 4)), htol(UInt32(n_uncompressed)))
+        end
+
+        blocksize = 18 + n_compressed + 8
+        fix_header!(compressed_block, blocksize)
+        nb = unsafe_write(stream.io, pointer(compressed_block), blocksize)
         if nb != blocksize
             error("failed to write a BGZF block")
         end
@@ -501,8 +519,6 @@ function write_blocks!(stream)
             block.block_offset = position(stream.io)
         end
         block.position = 1
-
-        reset_zstream(zstream, WRITE_MODE)
     end
 end
 
@@ -536,22 +552,3 @@ function is_eof_block(block)
     return true
 end
 
-# Reset the zstream.
-function reset_zstream(zstream, mode)
-    if mode == READ_MODE
-        @assert CodecZlib.inflate_reset!(zstream) == CodecZlib.Z_OK
-    else
-        @assert CodecZlib.deflate_reset!(zstream) == CodecZlib.Z_OK
-    end
-    return
-end
-
-# End the zstream.
-function end_zstream(zstream, mode)
-    if mode == READ_MODE
-        @assert CodecZlib.inflate_end!(zstream) == CodecZlib.Z_OK
-    else
-        @assert CodecZlib.deflate_end!(zstream) == CodecZlib.Z_OK
-    end
-    return
-end
