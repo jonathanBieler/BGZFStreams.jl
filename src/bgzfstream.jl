@@ -53,6 +53,7 @@ mutable struct Block
 
     # LibDeflate compressor (write) or decompressor (read)
     libdeflate::Union{LibDeflate.Compressor, LibDeflate.Decompressor}
+
 end
 
 function Block(mode)
@@ -380,27 +381,42 @@ function read_blocks!(stream)
     end
 
     # decompress blocks in parallel
+    # BGZF block layout (validated by read_bgzf_block!):
+    #   bytes 1-18  : gzip header (always exactly 18 bytes for BGZF)
+    #   bytes 19..N : raw DEFLATE compressed data
+    #   bytes N+1..4: CRC32 of uncompressed data
+    #   bytes N+5..8: ISIZE (uncompressed size)
     had_error = fill(false, n_blocks)
     error_msgs = fill("", n_blocks)
     Threads.@threads for i in 1:n_blocks
         block = stream.blocks[i]
         decompressor = block.libdeflate::LibDeflate.Decompressor
         in_data = block.compressed_block
-        GC.@preserve in_data begin
-            result = LibDeflate.unsafe_gzip_decompress!(
+        out_data = block.decompressed_block
+        bsize = block.compressed_size
+        GC.@preserve in_data out_data begin
+            isize      = ltoh(unsafe_load(Ptr{UInt32}(pointer(in_data, bsize - 3))))
+            crc_exp    = ltoh(unsafe_load(Ptr{UInt32}(pointer(in_data, bsize - 7))))
+            result = LibDeflate.unsafe_decompress!(
+                Base.HasLength(),
                 decompressor,
-                block.decompressed_block,
-                UInt(BGZF_MAX_BLOCK_SIZE),
-                pointer(in_data),
-                block.compressed_size,
-                nothing,
+                pointer(out_data),
+                isize,
+                pointer(in_data, 19),
+                bsize - 26,
             )
-        end
-        if result isa LibDeflate.LibDeflateError
-            had_error[i] = true
-            error_msgs[i] = string(result)
-        else
-            block.size = result.len
+            if result isa LibDeflate.LibDeflateError
+                had_error[i] = true
+                error_msgs[i] = string(result)
+            else
+                crc_obs = LibDeflate.unsafe_crc32(pointer(out_data), Int(isize))
+                if crc_obs != crc_exp
+                    had_error[i] = true
+                    error_msgs[i] = "CRC32 mismatch in BGZF block $i"
+                else
+                    block.size = Int(isize)
+                end
+            end
         end
     end
 
